@@ -11,15 +11,15 @@ from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
 import torch
 from diffusers.utils import load_image
 
-controlnet = ControlNetModel_Union.from_pretrained("yang1232009/ControlNetPlus-SDXL").to(torch.float16)
+controlnet = ControlNetModel_Union.from_pretrained("/home/cgv/yanghongji/weights/sdxl-controlplus").to(torch.float16)
 vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix").to(torch.float16)
 
 pipeline = StableDiffusionXLControlNetUnionPipeline.from_pretrained(
-    "yang1232009/ControlNetPlus-SDXL",
+    "stabilityai/stable-diffusion-xl-base-1.0",
     controlnet=controlnet,
     vae=vae,
     )
-pipeline.to("cuda")
+pipeline.to("cuda:7")
 pipeline.to(torch.float16)
 
 condition_image = load_image("./assets/condtion_images/guitar_normal.png")
@@ -27,6 +27,7 @@ condition_image = condition_image.resize((1024, 1024))
 
 image = [0] * 8
 image[3] = condition_image
+
 # canny, hed, zoe, normal, sam, dot, box, mask
 union_control_type = torch.Tensor([0,0,0,1,0,0,0,0])
 
@@ -35,7 +36,7 @@ prompt = 'A guitar'
 positive_prompt = ", ultra highres, sharpness texture, High detail RAW Photo, shallow depth of field, dslr, film grain"
 negative_prompt = "  blurry, disfigured, ugly, bad, immature, cartoon, anime, 3d, painting, b&w, cartoon, painting, illustration, worst quality, low quality"
 
-generator = torch.Generator(device="cuda").manual_seed(42)
+generator = torch.Generator(device="cuda:7").manual_seed(42)
 images = pipeline(
     prompt=prompt+positive_prompt, 
     negative_prompt=negative_prompt, 
@@ -47,5 +48,11 @@ images = pipeline(
 ).images[0]
 
 images.save("example.png")
+
 ```
 
+# IntraElement Controller (for layout injection)
+
+```bash
+bash train_intra_element_controller.sh
+```
