@@ -2,7 +2,7 @@ export MODEL_NAME="stabilityai/stable-diffusion-xl-base-1.0"
 export VAE_NAME="madebyollin/sdxl-vae-fp16-fix"
 export NCCL_P2P_DISABLE=1
 
-CUDA_VISIBLE_DEVICES=1,4,2,3 accelerate launch --config_file configs/zero2.yaml --main_process_port 29500 --num_processes 4 train_intra_element_controller.py \
+accelerate launch --config_file configs/zero2.yaml --main_process_port 29500 --num_processes 4 train_intra_element_controller.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --pretrained_vae_model_name_or_path=$VAE_NAME \
   --dataset_folder ./dmc120k \
