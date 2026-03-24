@@ -1,5 +1,13 @@
 # DC-ControlNet
 
+# Environment
+
+```bash
+conda create -n dc-control python=3.10
+conda activate dc-control
+pip install -r requirements.txt
+```
+
 
 # Content Encoder
 You can use the pretrained ControlNet model based on SDXL. 
@@ -36,7 +44,7 @@ prompt = 'A guitar'
 positive_prompt = ", ultra highres, sharpness texture, High detail RAW Photo, shallow depth of field, dslr, film grain"
 negative_prompt = "  blurry, disfigured, ugly, bad, immature, cartoon, anime, 3d, painting, b&w, cartoon, painting, illustration, worst quality, low quality"
 
-generator = torch.Generator(device="cuda:7").manual_seed(42)
+generator = torch.Generator(device="cuda").manual_seed(42)
 images = pipeline(
     prompt=prompt+positive_prompt, 
     negative_prompt=negative_prompt, 
