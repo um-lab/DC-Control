@@ -860,14 +860,14 @@ def prepare_train_dataset(dataset, accelerator):
             images = [Image.open(os.path.join(args.dataset_folder, image)).convert("RGB") for image in examples[args.image_column]]
             images = [image_transforms(image) for image in images]
 
-            content_images = [Image.open(os.path.join(args.dataset_folder, image[0]["condition_image"])).convert("RGB") for image in examples["objects"]]
+            content_images = [Image.open(os.path.join(args.dataset_folder, "condition", image[0]["condition_image"].replace("condition", "condition-1"))).convert("RGB") for image in examples["objects"]]
             content_images = [conditioning_image_pixel_align_transforms(image) for image in content_images] 
 
-            layout_images = [Image.open(os.path.join(args.dataset_folder, image[0]["layout"])).convert("RGB") for image in examples["objects"]]
+            layout_images = [Image.open(os.path.join(args.dataset_folder, "layout", image[0]["layout"])).convert("RGB") for image in examples["objects"]]
             layout_images = [conditioning_image_pixel_align_transforms(image) for image in layout_images] 
 
 
-            mask_images = [Image.open(os.path.join(args.dataset_folder, image[0]["loss_weight"])).convert("L") for image in examples["objects"]]
+            mask_images = [Image.open(os.path.join(args.dataset_folder, "layout", image[0]["loss_weight"])).convert("L") for image in examples["objects"]]
             mask_images = [loss_image_transforms(image) for image in mask_images] 
 
             examples["conditioning_content_pixel_values"] = content_images
