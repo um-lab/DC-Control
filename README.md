@@ -19,7 +19,7 @@ pipeline = StableDiffusionXLControlNetUnionPipeline.from_pretrained(
     controlnet=controlnet,
     vae=vae,
     )
-pipeline.to("cuda:7")
+pipeline.to("cuda")
 pipeline.to(torch.float16)
 
 condition_image = load_image("./assets/condtion_images/guitar_normal.png")

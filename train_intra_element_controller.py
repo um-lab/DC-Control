@@ -47,7 +47,6 @@ from diffusers import (
     ControlNetModel,
     DDPMScheduler,
     UNet2DConditionModel,
-    UNet2DConditionSmoothModel,
     UniPCMultistepScheduler,
 )
 from diffusers.optimization import get_scheduler
@@ -1063,7 +1062,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionSmoothModel)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DCondition_IntraElement_Controller)
                 ema_unet.load_state_dict(load_model.state_dict())
                 ema_unet.to(accelerator.device)
                 del load_model
@@ -1073,7 +1072,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DConditionSmoothModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UNet2DCondition_IntraElement_Controller.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
