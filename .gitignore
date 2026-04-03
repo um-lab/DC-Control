@@ -7,6 +7,7 @@ infer_intra_element_controller.py
 example.png
 sdxl-intra_element_controller/
 sdxl-inter_element_controller/
+condtion_images/
 # compiled files
 __pycache__/
 tools/

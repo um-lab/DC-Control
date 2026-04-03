@@ -13,7 +13,6 @@ accelerate launch --config_file configs/zero2.yaml --main_process_port 29500 --n
   --resolution=1024 \
   --prompt_dropout=0.0 \
   --dataloader_num_workers 4 \
-  --max_train_samples=95000 \
   --train_batch_size=2 \
   --gradient_accumulation_steps=4 \
   --max_train_steps=80000 \

@@ -8,6 +8,12 @@ conda activate dc-control
 pip install -r requirements.txt
 ```
 
+# Weights
+| Model | Path |
+| :--- | :---: |
+| Content Encoder | [ControlNetPlus-SDXL](https://huggingface.co/yang1232009/ControlNetPlus-SDXL) |
+| Intra-Element Controller | [yang1232009/DC-ControlNet](https://huggingface.co/yang1232009/DC-ControlNet) |
+| Inter-Element Controller | Coming soon |
 
 # Content Encoder
 You can use the pretrained ControlNet model based on SDXL. 

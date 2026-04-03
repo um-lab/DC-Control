@@ -60,7 +60,7 @@ if is_wandb_available():
     import wandb
 
 from models.model_inter import UNet2DCondition_InterElement_Controller
-from pipelines.pipeline_intra_element_controller import StableDiffusionXLControlNetDotPipeline
+from pipelines.pipeline_inter_element_controller import StableDiffusionXLControlNetInterElementControllerPipeline
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0.dev0")
@@ -99,7 +99,7 @@ def log_validation(vae, unet, controlnet, text_encoder_one, text_encoder_two, to
 
     if not is_final_validation:
         unet = accelerator.unwrap_model(unet)
-        pipeline = StableDiffusionXLControlNetDotPipeline(
+        pipeline = StableDiffusionXLControlNetInterElementControllerPipeline(
             vae=vae,
             unet=unet,
             controlnet=controlnet, 
@@ -111,8 +111,7 @@ def log_validation(vae, unet, controlnet, text_encoder_one, text_encoder_two, to
         )
 
     else:
-        # unet = accelerator.unwrap_model(unet)
-        pipeline = StableDiffusionXLControlNetDotPipeline(
+        pipeline = StableDiffusionXLControlNetInterElementControllerPipeline(
             vae=vae,
             unet=unet,
             controlnet=controlnet, 
@@ -131,16 +130,84 @@ def log_validation(vae, unet, controlnet, text_encoder_one, text_encoder_two, to
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    
-    validation_prompts = args.validation_prompt
-    validation_condition_prompts = args.validation_condition_prompt
-    validation_condition_images = args.validation_image
-    validation_layout_images = args.validation_layout_image
-    layout_types = args.validation_layout_type
-    control_types = args.validation_control_type
-
     positive_prompt = " highly detailed background, ultra highres, sharpness texture, High detail RAW Photo, shallow depth of field, dslr, film grain"
     negative_prompt = " blurry, disfigured, ugly, bad, immature, cartoon, anime, 3d, painting, b&w, cartoon, painting, illustration, worst quality, low quality"
+
+    def _split_list(s: str) -> List[str]:
+        if s is None:
+            return []
+        if not isinstance(s, str):
+            raise ValueError(f"Expected str, got {type(s)}")
+        return [x for x in s.replace(",", "|").split("|") if x != ""]
+
+    def _load_rgb(path: str) -> Image.Image:
+        img = Image.open(path).convert("RGB")
+        return img.resize((args.resolution, args.resolution))
+
+    use_multi = bool(getattr(args, "validation_multi", False)) or (
+        getattr(args, "validation_image_list", None) is not None
+        or getattr(args, "validation_layout_image_list", None) is not None
+        or getattr(args, "validation_control_type_list", None) is not None
+        or getattr(args, "validation_layout_type_list", None) is not None
+    )
+
+    if use_multi:
+        validation_prompts = args.validation_prompt
+        validation_image_list = args.validation_image_list
+        validation_layout_image_list = args.validation_layout_image_list
+        validation_control_type_list = args.validation_control_type_list
+        validation_layout_type_list = args.validation_layout_type_list
+        if getattr(args, "validation_condition_prompt_list", None) is not None:
+            validation_condition_prompt_list = args.validation_condition_prompt_list
+        else:
+            validation_condition_prompt_list = args.validation_condition_prompt
+
+        if validation_prompts is None:
+            raise ValueError("`--validation_prompt` must be provided for validation.")
+        if validation_image_list is None or validation_layout_image_list is None:
+            raise ValueError("Multi validation requires `--validation_image_list` and `--validation_layout_image_list`.")
+        if validation_control_type_list is None or validation_layout_type_list is None:
+            raise ValueError("Multi validation requires `--validation_control_type_list` and `--validation_layout_type_list`.")
+        if validation_condition_prompt_list is None:
+            raise ValueError("Multi validation requires `--validation_condition_prompt_list` (or `--validation_condition_prompt`).")
+
+        items = zip(
+            validation_prompts,
+            validation_condition_prompt_list,
+            validation_image_list,
+            validation_layout_image_list,
+            validation_control_type_list,
+            validation_layout_type_list,
+        )
+    else:
+        validation_prompts = args.validation_prompt
+        validation_condition_prompts = args.validation_condition_prompt
+        validation_condition_images = args.validation_image
+        validation_layout_images = args.validation_layout_image
+        layout_types = args.validation_layout_type
+        control_types = args.validation_control_type
+
+        if (
+            validation_prompts is None
+            or validation_condition_prompts is None
+            or validation_condition_images is None
+            or validation_layout_images is None
+            or control_types is None
+            or layout_types is None
+        ):
+            raise ValueError(
+                "Single validation requires `--validation_prompt`, `--validation_condition_prompt`, "
+                "`--validation_image`, `--validation_layout_image`, `--validation_control_type`, `--validation_layout_type`."
+            )
+
+        items = zip(
+            validation_prompts,
+            validation_condition_prompts,
+            validation_condition_images,
+            validation_layout_images,
+            control_types,
+            layout_types,
+        )
 
 
     image_logs = []
@@ -149,43 +216,97 @@ def log_validation(vae, unet, controlnet, text_encoder_one, text_encoder_two, to
     else:
         autocast_ctx = torch.autocast(accelerator.device.type)
 
-    for validation_prompt, validation_condition_prompt, validation_condition_image, validation_layout_image, control_type, layout_type in \
-        zip(validation_prompts, validation_condition_prompts, validation_condition_images, validation_layout_images, control_types, layout_types):
+    for validation_prompt, validation_condition_prompt, validation_condition_image, validation_layout_image, control_type, layout_type in items:
+        if use_multi:
+            condition_image_paths = _split_list(validation_condition_image)
+            layout_image_paths = _split_list(validation_layout_image)
+            control_type_ids = [int(x) for x in _split_list(control_type)]
+            layout_type_ids = [int(x) for x in _split_list(layout_type)]
 
-        validation_condition_image = Image.open(validation_condition_image).convert("RGB")
-        validation_condition_image = validation_condition_image.resize((args.resolution, args.resolution))
+            if not (len(condition_image_paths) == len(layout_image_paths) == len(control_type_ids) == len(layout_type_ids)):
+                raise ValueError(
+                    "Multi validation per sample requires the same number of elements for "
+                    "`validation_image_list`, `validation_layout_image_list`, `validation_control_type_list`, `validation_layout_type_list`."
+                )
+            num_elements = len(condition_image_paths)
+            if num_elements == 0:
+                raise ValueError("Multi validation requires at least 1 element per sample.")
 
-        validation_layout_image = Image.open(validation_layout_image).convert("RGB")
-        validation_layout_image = validation_layout_image.resize((args.resolution, args.resolution))
+            cond_images = [_load_rgb(p) for p in condition_image_paths]
+            layout_images = [_load_rgb(p) for p in layout_image_paths]
 
+            if isinstance(validation_condition_prompt, str):
+                cond_prompts = _split_list(validation_condition_prompt)
+                if len(cond_prompts) == 0:
+                    cond_prompts = [validation_condition_prompt]
+            else:
+                cond_prompts = list(validation_condition_prompt)
 
-        images = []
+            if len(cond_prompts) == 1 and num_elements > 1:
+                cond_prompts = cond_prompts * num_elements
+            if len(cond_prompts) != num_elements:
+                raise ValueError(
+                    f"Multi validation condition prompts must have length 1 or {num_elements}, got {len(cond_prompts)}"
+                )
 
-        for _ in range(args.num_validation_images):
-            with autocast_ctx:
+            per_element_image_list = []
+            for img, ct in zip(cond_images, control_type_ids):
+                img_list = [0] * 8
+                img_list[int(ct)] = img
+                per_element_image_list.append(img_list)
+
+            images = []
+            for _ in range(args.num_validation_images):
+                with autocast_ctx:
                     image = pipeline(
-                        prompt=validation_prompt+positive_prompt, 
-                        condition_prompt=validation_condition_prompt,
-                        negative_prompt=negative_prompt, 
-                        image_list=[validation_condition_image if i == int(control_type) else 0 for i in range(8)], 
-                        control_type=F.one_hot(torch.Tensor([int(control_type)]).long(), num_classes=8).float(),
-                        layout_image=[validation_layout_image if i == int(layout_type) else 0 for i in range(4)], 
-                        layout_type=F.one_hot(torch.Tensor([int(layout_type)]).long(), num_classes=4).float(),
-                        num_inference_steps=50, 
+                        prompt=validation_prompt + positive_prompt,
+                        condition_prompt=cond_prompts,
+                        negative_prompt=negative_prompt,
+                        image_list=per_element_image_list,
+                        control_conditions=[layout_images, control_type_ids, layout_type_ids],
+                        num_inference_steps=50,
                         generator=generator,
                         num_images_per_prompt=1,
                     ).images[0]
-            images.append(image)
+                images.append(image)
 
-
-        image_logs.append(
-            {
-                "validation_image": validation_condition_image, 
-                "validation_layout_image":validation_layout_image, 
-                "images": images, 
-                "validation_prompt": validation_prompt
+            image_logs.append(
+                {
+                    "validation_image": cond_images,
+                    "validation_layout_image": layout_images,
+                    "images": images,
+                    "validation_prompt": validation_prompt,
                 }
-        )
+            )
+        else:
+            validation_condition_image = _load_rgb(validation_condition_image)
+            validation_layout_image = _load_rgb(validation_layout_image)
+
+            images = []
+            for _ in range(args.num_validation_images):
+                with autocast_ctx:
+                    image = pipeline(
+                        prompt=validation_prompt + positive_prompt,
+                        condition_prompt=validation_condition_prompt,
+                        negative_prompt=negative_prompt,
+                        image_list=[validation_condition_image if i == int(control_type) else 0 for i in range(8)],
+                        control_type=F.one_hot(torch.tensor([int(control_type)], dtype=torch.long), num_classes=8).float(),
+                        layout_image=[validation_layout_image if i == int(layout_type) else 0 for i in range(4)],
+                        layout_type=F.one_hot(torch.tensor([int(layout_type)], dtype=torch.long), num_classes=4).float(),
+                        num_inference_steps=50,
+                        generator=generator,
+                        num_images_per_prompt=1,
+                    ).images[0]
+                images.append(image)
+
+            image_logs.append(
+                {
+                    "validation_image": validation_condition_image,
+                    "validation_layout_image": validation_layout_image,
+                    "images": images,
+                    "validation_prompt": validation_prompt,
+                }
+            )
 
     tracker_key = "test" if is_final_validation else "validation"
     for tracker in accelerator.trackers:
@@ -194,16 +315,21 @@ def log_validation(vae, unet, controlnet, text_encoder_one, text_encoder_two, to
                 images = log["images"]
                 validation_prompt = log["validation_prompt"]
                 validation_image = log["validation_image"]
+                validation_layout_images = log["validation_layout_image"]
 
                 formatted_images = []
-                if isinstance(validation_image_, list):
-                    for val_img in validation_image:
-                        formatted_images.append(np.asarray(val_img))
+                if isinstance(validation_image, list):
+                    formatted_images.extend([np.asarray(val_img) for val_img in validation_image])
                 else:
                     formatted_images.append(np.asarray(validation_image))
 
                 for image in images:
                     formatted_images.append(np.asarray(image))
+
+                if isinstance(validation_layout_images, list):
+                    formatted_images.extend([np.asarray(val_img) for val_img in validation_layout_images])
+                else:
+                    formatted_images.append(np.asarray(validation_layout_images))
 
                 formatted_images = np.stack(formatted_images)
 
@@ -240,11 +366,11 @@ def log_validation(vae, unet, controlnet, text_encoder_one, text_encoder_two, to
         else:
             logger.warning(f"image logging not implemented for {tracker.name}")
 
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
+    del pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
 
-        return image_logs
+    return image_logs
 
 
 def import_model_class_from_model_name_or_path(
@@ -275,10 +401,24 @@ def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=N
             images = log["images"]
             validation_prompt = log["validation_prompt"]
             validation_image = log["validation_image"]
-            validation_image.save(os.path.join(repo_folder, "image_control.png"))
+            if isinstance(validation_image, list):
+                validation_image[0].save(os.path.join(repo_folder, "image_control.png"))
+            else:
+                validation_image.save(os.path.join(repo_folder, "image_control.png"))
             img_str += f"prompt: {validation_prompt}\n"
-            images = [validation_image] + images
-            make_image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
+            validation_layout_image = log.get("validation_layout_image", None)
+            images_to_grid = []
+            if isinstance(validation_image, list):
+                images_to_grid.extend(validation_image)
+            else:
+                images_to_grid.append(validation_image)
+            images_to_grid.extend(images)
+            if validation_layout_image is not None:
+                if isinstance(validation_layout_image, list):
+                    images_to_grid.extend(validation_layout_image)
+                else:
+                    images_to_grid.append(validation_layout_image)
+            make_image_grid(images_to_grid, 1, len(images_to_grid)).save(os.path.join(repo_folder, f"images_{i}.png"))
             img_str += f"![images_{i})](./images_{i}.png)\n"
 
     model_description = f"""
@@ -680,6 +820,47 @@ def parse_args(input_args=None):
             "A set of paths to the controlnet conditioning image be evaluated every `--validation_layout_image`"
         ),
     )
+
+    parser.add_argument(
+        "--validation_multi",
+        action="store_true",
+        help="Enable multi-element validation. Use *_list args where each item uses '|' (or ',') to separate elements.",
+    )
+    parser.add_argument(
+        "--validation_image_list",
+        type=str,
+        default=None,
+        nargs="+",
+        help="Per validation sample, element condition image paths separated by '|' (or ',').",
+    )
+    parser.add_argument(
+        "--validation_layout_image_list",
+        type=str,
+        default=None,
+        nargs="+",
+        help="Per validation sample, element layout image paths separated by '|' (or ',').",
+    )
+    parser.add_argument(
+        "--validation_control_type_list",
+        type=str,
+        default=None,
+        nargs="+",
+        help="Per validation sample, element control type ids separated by '|' (or ',').",
+    )
+    parser.add_argument(
+        "--validation_layout_type_list",
+        type=str,
+        default=None,
+        nargs="+",
+        help="Per validation sample, element layout type ids separated by '|' (or ',').",
+    )
+    parser.add_argument(
+        "--validation_condition_prompt_list",
+        type=str,
+        default=None,
+        nargs="+",
+        help="Per validation sample, element condition prompts separated by '|' (or ',').",
+    )
      
 
     parser.add_argument(
@@ -989,25 +1170,10 @@ def collate_fn(examples):
     add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
     add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
 
-
-    # condition_ids_list = []
-    # add_condition_text_embeds_list = []
-    # controlnet_added_conditions_list = []
-    # for example in examples:
-    #     num_elems = len(example["prompt_condition_embeds"])
-    #     condition_ids = torch.stack([torch.tensor(example["prompt_condition_embeds"]) for example in examples])
-    #     add_condition_text_embeds = torch.stack([torch.tensor(example["condition_text_embeds"]) for example in examples])
-        
-    #     condition_ids_list.append(condition_ids)
-    #     controlnet_added_conditions_list.append({
-    #         "text_embeds": add_condition_text_embeds,
-    #         "time_ids": add_time_ids,
-    #         })
     
     condition_ids_list = torch.stack([torch.tensor(example["prompt_condition_embeds"]) for example in examples])
     add_condition_text_embeds = torch.stack([torch.tensor(example["condition_text_embeds"]) for example in examples])
 
-    print(condition_ids_list.shape, add_condition_text_embeds.shape, content_list.shape)
     return {
         "pixel_values": pixel_values,
         "prompt_ids": prompt_ids,
@@ -1455,26 +1621,6 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-    def de_noise(noisy_latents, model_pred, timesteps):
-        alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=timesteps.device)
-
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(noisy_latents.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_latents.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-        original_samples = (noisy_latents - sqrt_one_minus_alpha_prod * model_pred) / sqrt_alpha_prod
-
-        return original_samples, sqrt_one_minus_alpha_prod
-
-    mean_reg_variation = 0 # need to be manually resumed
-    mean_reg_variation1 = [0 for _ in range(10)]
-
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
@@ -1510,11 +1656,6 @@ def main(args):
                 num_elements = batch["num_elements"]
                 max_num_elements = int(num_elements.max().item())
 
-                accelerator.print(num_elements.shape) # [B]
-                accelerator.print(batch["condition_ids_list"].shape) # [B, L+1, 77, C]
-                accelerator.print(batch["conditioning_content_pixel_values"].shape) # [L+1, C, H, W]
-                accelerator.print(batch["add_condition_text_embeds"].shape) # [L+1, 1, C]
-                accelerator.print(batch["condition_type"].shape) # [B, L+1]
                 # MultiControlNet
                 controlnet_results = []
                 add_time_ids = batch["unet_added_conditions"]["time_ids"]
@@ -1602,19 +1743,19 @@ def main(args):
 
                 layout_latents = controlnet_layout_image.permute(1, 0, 2, 3, 4).contiguous()
 
-                loss_weight = batch["conditioning_mask_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                loss_weight = batch["conditioning_mask_pixel_values"].to(accelerator.device, dtype=weight_dtype) # [B, L+1, 1, H, W]
 
                 ori_loss_weight = loss_weight
-                loss_weight = (loss_weight > 0).float()
-                # # reweighted
+                loss_weight = (loss_weight.sum(dim=1) > 0).float()
+                # reweighted
                 mask_area = loss_weight.sum()  
                 total_area = loss_weight.numel() 
                 mask_weight = total_area / (mask_area + 1e-6)
                 loss_weight = loss_weight * mask_weight + 1
+                accelerator.print(loss_weight.shape)
                 
-
                 # Predict the noise residual
-                model_pred, mid_hidden_sample = unet(
+                model_pred, _ = unet(
                     noisy_latents,
                     timesteps,
                     dot_hidden_states = layout_latents,
@@ -1637,6 +1778,7 @@ def main(args):
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
 
                 theta_loss = loss.mean()
+                accelerator.print(loss.shape, loss_weight.shape)
                 loss = (loss * loss_weight).mean()
 
                 loss_total = loss
