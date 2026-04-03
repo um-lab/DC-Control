@@ -420,7 +420,20 @@ class Layout_Embedder(nn.Module):
 
         intermediate_results = []
 
-        indices = torch.nonzero(input_type)
+        if input_type is None:
+            raise ValueError("input_type is required")
+
+        if torch.is_tensor(input_type) and input_type.dim() == 3:
+            token_type_map = input_type[0]
+            control_type_any = (input_type.sum(dim=1) > 0).float()
+        elif torch.is_tensor(input_type) and input_type.dim() == 2:
+            token_type_map = input_type[0]
+            control_type_any = input_type
+        else:
+            token_type_map = input_type
+            control_type_any = input_type
+
+        indices = torch.nonzero(token_type_map)
         inputs = []
         condition_list = []
 
@@ -429,9 +442,26 @@ class Layout_Embedder(nn.Module):
                 controlnet_cond = sample
                 feat_seq = torch.mean(controlnet_cond, dim=(2, 3)) # N * C
             else:
-                controlnet_cond = self.controlnet_cond_embedding(x[indices[idx][1]])
+                if token_type_map.dim() == 2:
+                    element_idx = int(indices[idx][0].item())
+                    type_idx = int(indices[idx][1].item())
+                else:
+                    element_idx = None
+                    type_idx = int(indices[idx][0].item())
+
+                if torch.is_tensor(x):
+                    if x.dim() == 5:
+                        cond_img = x[element_idx]
+                    elif x.dim() == 4:
+                        cond_img = x
+                    else:
+                        raise ValueError(f"Unexpected dot_hidden_states shape: {tuple(x.shape)}")
+                else:
+                    cond_img = x[type_idx]
+
+                controlnet_cond = self.controlnet_cond_embedding(cond_img)
                 feat_seq = torch.mean(controlnet_cond, dim=(2, 3)) # N * C
-                feat_seq = feat_seq + self.task_embedding[indices[idx][1]]
+                feat_seq = feat_seq + self.task_embedding[type_idx]
 
             inputs.append(feat_seq.unsqueeze(1))
             condition_list.append(controlnet_cond)
@@ -449,7 +479,10 @@ class Layout_Embedder(nn.Module):
         
         sample = sample + controlnet_cond_fuser
 
-        control_embeds = self.control_type_proj(input_type.flatten())
+        if torch.is_tensor(control_type_any) and control_type_any.dim() == 1:
+            control_type_any = control_type_any.unsqueeze(0).expand(sample.shape[0], -1)
+
+        control_embeds = self.control_type_proj(control_type_any.flatten())
         control_embeds = control_embeds.reshape((x.shape[0], -1))
         control_embeds = control_embeds.to(x.dtype)
         control_emb = self.control_add_embedding(control_embeds)
@@ -514,18 +547,53 @@ class InterElementLayer(nn.Module):
 
         self.heads = attn_head
 
+        self.spatial_transformer = attn_ffn_rope(hidden_size)
+        self.out_linear1 = zero_module(nn.Linear(hidden_size, 1))
+
+        self.condition_transformer = attn_ffn_rope(hidden_size)
+        self.out_linear2 = nn.Linear(hidden_size, 1)
+
     def forward(self, x, c, t, loss_weight=None, norm=False):
 
         B, C, H, W = x.shape
+        temporal_size = c.shape[1]
+        # spatial part
+        concat_feature = rearrange(c, "B T S C -> (B T) S C", T=temporal_size, S=H*W)
+        pos_emb = get_2d_rotary_pos_embed(C//self.heads, crops_coords=((0,0),(H,W)), grid_size=(H,W))
+        concat_feature_ = self.spatial_transformer(concat_feature, pos_emb, pos_emb)
+        alpha = self.out_linear1(concat_feature_) # BT, S, 1
+        alpha = torch.sigmoid(alpha)
 
-        x_m = x + c
+        # spatital reweight
+        concat_feature = concat_feature * 2 * alpha  # BT, S, C x BT, S, 1
+
+        # condition part
+        concat_feature = rearrange(concat_feature, "(B T) S C -> (B S) T C", T=temporal_size, S=H*W)
+        grid_t = np.arange(temporal_size, dtype=np.float32)
+        prior_emb = get_1d_rotary_pos_embed(C // self.heads, grid_t, use_real=True)
+        concat_feature_ = self.condition_transformer(concat_feature, prior_emb, prior_emb) # B T C
+
+        # condition reweight
+        alpha = self.out_linear2(concat_feature_) # B, T, 1
+        dtype = alpha.dtype
+        alpha = alpha.to(torch.float32)
+        alpha = F.softmax(alpha, dim=1, dtype=torch.float32)
+        alpha = alpha.to(dtype)
+
+        concat_feature = concat_feature * alpha
+        concat_feature = rearrange(concat_feature, "(B S) T C -> B T S C", T=temporal_size, S=H*W)
+
+        c = torch.sum(concat_feature, dim=1)
+
+        x_m = x + c.permute(0, 2, 1).view(B, C, H, W)
 
         shift_loss = 0
+
         return x_m, shift_loss
 
 
 
-class UNet2DCondition_IntraElement_Controller(
+class UNet2DCondition_InterElement_Controller(
     ModelMixin, ConfigMixin, FromOriginalModelMixin, UNet2DConditionLoadersMixin, PeftAdapterMixin
 ):
     r"""
@@ -1737,13 +1805,64 @@ class UNet2DCondition_IntraElement_Controller(
 
         add_sample = []
         
-        controlnet_features = []
+        def to_btsc(feat):
+            B, C, H, W = feat.shape
+            return feat.permute(0, 2, 3, 1).reshape(B, 1, H * W, C)
 
-        controlnet_features.extend(down_block_additional_residuals)
-        controlnet_features.extend([mid_block_additional_residual]) # [B, C, H, W]
+        if (
+            down_block_additional_residuals is not None
+            and len(down_block_additional_residuals) > 0
+            and torch.is_tensor(down_block_additional_residuals[0])
+            and down_block_additional_residuals[0].dim() == 5
+        ):
+            num_controlnets = down_block_additional_residuals[0].shape[0]
+            layout_features_per_controlnet = []
 
+            for controlnet_idx in range(num_controlnets):
+                controlnet_features = [x[controlnet_idx] for x in down_block_additional_residuals]
+                controlnet_features.append(mid_block_additional_residual[controlnet_idx])
 
-        layout_features = self.layout_embedder(dot_hidden_states, layout_control_sample, controlnet_features, temb=emb, input_type=layout_control_type)
+                dot_hidden_states_i = (
+                    dot_hidden_states[controlnet_idx]
+                    if torch.is_tensor(dot_hidden_states) and dot_hidden_states.dim() == 5
+                    else dot_hidden_states
+                )
+                layout_control_type_i = (
+                    layout_control_type[:, controlnet_idx]
+                    if torch.is_tensor(layout_control_type) and layout_control_type.dim() == 3
+                    else layout_control_type
+                )
+
+                layout_features_i = self.layout_embedder(
+                    dot_hidden_states_i,
+                    layout_control_sample,
+                    controlnet_features,
+                    temb=emb,
+                    input_type=layout_control_type_i,
+                )
+                layout_features_per_controlnet.append(layout_features_i)
+
+            num_layers = len(layout_features_per_controlnet[0])
+            layout_features = []
+            for layer_idx in range(num_layers):
+                layer_stack = torch.stack(
+                    [layout_features_per_controlnet[c][layer_idx] for c in range(num_controlnets)], dim=1
+                )  # [B, T, C, H, W]
+                B, T, C, H, W = layer_stack.shape
+                layout_features.append(layer_stack.permute(0, 1, 3, 4, 2).reshape(B, T, H * W, C))
+        else:
+            controlnet_features = []
+            controlnet_features.extend(down_block_additional_residuals)
+            controlnet_features.extend([mid_block_additional_residual]) # [B, C, H, W]
+
+            layout_features = self.layout_embedder(
+                dot_hidden_states,
+                layout_control_sample,
+                controlnet_features,
+                temb=emb,
+                input_type=layout_control_type,
+            )
+            layout_features = [to_btsc(f) for f in layout_features]
         
 
         if is_controlnet:
@@ -1845,4 +1964,3 @@ class UNet2DCondition_IntraElement_Controller(
             return (sample, add_sample)
 
         return UNet2DConditionOutput(sample=sample)
-

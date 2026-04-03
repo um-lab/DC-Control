@@ -59,7 +59,7 @@ from torch import nn, autograd, optim
 if is_wandb_available():
     import wandb
 
-from models.model import UNet2DCondition_IntraElement_Controller
+from models.model_inter import UNet2DCondition_InterElement_Controller
 from pipelines.pipeline_intra_element_controller import StableDiffusionXLControlNetDotPipeline
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -314,6 +314,13 @@ def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a ControlNet training script.")
     parser.add_argument(
         "--pretrained_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_intra_model_name_or_path",
         type=str,
         default=None,
         required=True,
@@ -781,10 +788,11 @@ def get_train_dataset(args, accelerator):
                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
-    with accelerator.main_process_first():
-        train_dataset = dataset.shuffle(seed=args.seed)
-        if args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(args.max_train_samples))
+    train_dataset = dataset.select(range(args.max_train_samples))
+    # with accelerator.main_process_first():
+    #     train_dataset = dataset.shuffle(seed=args.seed)
+    #     if args.max_train_samples is not None:
+    #         train_dataset = train_dataset.select(range(args.max_train_samples))
     return train_dataset
 
 
@@ -855,32 +863,57 @@ def prepare_train_dataset(dataset, accelerator):
     )
 
     def preprocess_train(examples):
-        try:
+        # try:
+        if True:
             images = [Image.open(os.path.join(args.dataset_folder, image)).convert("RGB") for image in examples[args.image_column]]
             images = [image_transforms(image) for image in images]
 
-            content_images = [Image.open(os.path.join(args.dataset_folder, "condition", image[0]["condition_image"].replace("condition", "condition-1"))).convert("RGB") for image in examples["objects"]]
-            content_images = [conditioning_image_pixel_align_transforms(image) for image in content_images] 
+            # background_images = [Image.open(os.path.join(args.dataset_folder, image)).convert("RGB") for image in examples["background_image"]]
+            # background_images = [conditioning_image_pixel_align_transforms(image) for image in background_images]
 
-            layout_images = [Image.open(os.path.join(args.dataset_folder, "layout", image[0]["layout"])).convert("RGB") for image in examples["objects"]]
-            layout_images = [conditioning_image_pixel_align_transforms(image) for image in layout_images] 
+            processed_objects_batch = []
+            for example_objs, example_background, example_background_type in zip(
+                examples["objects"], examples["background_image"], examples["background_type"]
+            ):
+                processed_objs = []
+                for obj in example_objs:
+                    processed_obj = dict(obj)
 
+                    c_img = Image.open(os.path.join(args.dataset_folder, obj["condition_image"])).convert("RGB")
+                    processed_obj["condition_image"] = conditioning_image_pixel_align_transforms(c_img)
 
-            mask_images = [Image.open(os.path.join(args.dataset_folder, "layout", image[0]["loss_weight"])).convert("L") for image in examples["objects"]]
-            mask_images = [loss_image_transforms(image) for image in mask_images] 
+                    l_img = Image.open(os.path.join(args.dataset_folder, obj["layout"])).convert("RGB")
+                    processed_obj["layout"] = conditioning_image_pixel_align_transforms(l_img)
 
-            examples["conditioning_content_pixel_values"] = content_images
-            examples["conditioning_layout_pixel_values"] = layout_images
-            examples["conditioning_mask_pixel_values"] = mask_images
-            
+                    m_img = Image.open(os.path.join(args.dataset_folder, obj["loss_weight"])).convert("L")
+                    processed_obj["loss_weight"] = loss_image_transforms(m_img)
+
+                    processed_objs.append(processed_obj)
+
+                background_img = Image.open(os.path.join(args.dataset_folder, example_background)).convert("RGB")
+                white_layout_img = Image.new("RGB", background_img.size, (255, 255, 255))
+                background_loss_weight = Image.new("L", background_img.size, (0,))
+
+                processed_objs.append(
+                    {
+                        "condition_image": conditioning_image_pixel_align_transforms(background_img),
+                        "layout": conditioning_image_pixel_align_transforms(white_layout_img),
+                        "loss_weight": loss_image_transforms(background_loss_weight),
+                        "condition_type": example_background_type,
+                        "layout_type": 1,
+                    }
+                )
+
+                processed_objects_batch.append(processed_objs)
+
+            examples["objects"] = processed_objects_batch
             examples["pixel_values"] = images
-            examples["condition_type"] = [condition_type[0]["condition_type"] for condition_type in examples["objects"]]
-            examples["layout_type"] = [layout_type[0]["layout_type"] for layout_type in examples["objects"]]
+            
             return examples
 
-        except Exception as e:
-            print("skip bad sample", e)
-            return None
+        # except Exception as e:
+        #     print("skip bad sample", e)
+        #     return None
 
     dataset = dataset.with_transform(preprocess_train)
 
@@ -888,47 +921,108 @@ def prepare_train_dataset(dataset, accelerator):
 
 
 def collate_fn(examples):
-    # examples = [example for example in examples if example is not None]
-    # if len(examples) == 0:
-    #     return None
+    # batch size
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    conditioning_content_pixel_values = torch.stack([example["conditioning_content_pixel_values"] for example in examples])
-    conditioning_content_pixel_values = conditioning_content_pixel_values.to(memory_format=torch.contiguous_format).float()
+    num_elements = torch.stack(
+        [
+            torch.tensor(example.get("num_condition", len(example["objects"]) - 1), dtype=torch.long)
+            for example in examples
+        ]
+    )
 
-    conditioning_layout_pixel_values = torch.stack([example["conditioning_layout_pixel_values"] for example in examples])
-    conditioning_layout_pixel_values = conditioning_layout_pixel_values.to(memory_format=torch.contiguous_format).float()
+    content_list = []
+    layout_list = []
+    mask_list = []
+    ctype_list = []
+    ltype_list = []
 
-    conditioning_mask_pixel_values = torch.stack([example["conditioning_mask_pixel_values"] for example in examples])
-    conditioning_mask_pixel_values = conditioning_mask_pixel_values.to(memory_format=torch.contiguous_format).float()
 
+    # for example in examples:
+        
+    #     c_tensor = torch.stack(example["conditioning_content_pixel_values"]).to(memory_format=torch.contiguous_format).float()
+    #     l_tensor = torch.stack(example["conditioning_layout_pixel_values"]).to(memory_format=torch.contiguous_format).float()
+    #     m_tensor = torch.stack(example["conditioning_mask_pixel_values"]).to(memory_format=torch.contiguous_format).float()
 
+    #     ct_tensor = torch.tensor(example["condition_type"], dtype=torch.long)
+        
+    #     lt_tensor = torch.tensor(example["layout_type"], dtype=torch.long)
+
+    #     content_list.append(c_tensor)
+    #     layout_list.append(l_tensor)
+    #     mask_list.append(m_tensor)
+    #     ctype_list.append(ct_tensor)
+    #     ltype_list.append(lt_tensor)
+    content_list = torch.stack(
+        [
+            torch.stack([obj["condition_image"] for obj in example["objects"]])
+            .to(memory_format=torch.contiguous_format)
+            .float()
+            for example in examples
+        ]
+    )
+    layout_list = torch.stack(
+        [
+            torch.stack([obj["layout"] for obj in example["objects"]])
+            .to(memory_format=torch.contiguous_format)
+            .float()
+            for example in examples
+        ]
+    )
+    mask_list = torch.stack(
+        [
+            torch.stack([obj["loss_weight"] for obj in example["objects"]])
+            .to(memory_format=torch.contiguous_format)
+            .float()
+            for example in examples
+        ]
+    )
+    ctype_list = torch.stack(
+        [torch.tensor([obj["condition_type"] for obj in example["objects"]], dtype=torch.long) for example in examples]
+    )
+    ltype_list = torch.stack(
+        [torch.tensor([obj["layout_type"] for obj in example["objects"]], dtype=torch.long) for example in examples]
+    )
 
     prompt_ids = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
     add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
     add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
 
-    condition_ids = torch.stack([torch.tensor(example["prompt_condition_embeds"]) for example in examples])
+
+    # condition_ids_list = []
+    # add_condition_text_embeds_list = []
+    # controlnet_added_conditions_list = []
+    # for example in examples:
+    #     num_elems = len(example["prompt_condition_embeds"])
+    #     condition_ids = torch.stack([torch.tensor(example["prompt_condition_embeds"]) for example in examples])
+    #     add_condition_text_embeds = torch.stack([torch.tensor(example["condition_text_embeds"]) for example in examples])
+        
+    #     condition_ids_list.append(condition_ids)
+    #     controlnet_added_conditions_list.append({
+    #         "text_embeds": add_condition_text_embeds,
+    #         "time_ids": add_time_ids,
+    #         })
+    
+    condition_ids_list = torch.stack([torch.tensor(example["prompt_condition_embeds"]) for example in examples])
     add_condition_text_embeds = torch.stack([torch.tensor(example["condition_text_embeds"]) for example in examples])
 
-    condition_type = torch.stack([torch.tensor(example["condition_type"]) for example in examples])
-    layout_type = torch.stack([torch.tensor(example["layout_type"]) for example in examples])
-
+    print(condition_ids_list.shape, add_condition_text_embeds.shape, content_list.shape)
     return {
         "pixel_values": pixel_values,
-        "conditioning_content_pixel_values": conditioning_content_pixel_values,
-        "conditioning_layout_pixel_values": conditioning_layout_pixel_values,
-        "conditioning_mask_pixel_values": conditioning_mask_pixel_values,
         "prompt_ids": prompt_ids,
-        "condition_ids": condition_ids,
-        "layout_type": layout_type,
-        "condition_type": condition_type,
+
+        "num_elements": num_elements,
+        "conditioning_content_pixel_values": content_list,
+        "conditioning_layout_pixel_values": layout_list,
+        "conditioning_mask_pixel_values": mask_list,
+        "condition_type": ctype_list,
+        "layout_type": ltype_list,
+
         "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
-        "controlnet_added_conditions": {
-            "text_embeds": add_condition_text_embeds, 
-            "time_ids": add_time_ids,
-            },
+        "condition_ids_list": condition_ids_list,
+        "add_condition_text_embeds": add_condition_text_embeds,
+        # "controlnet_added_conditions_list": controlnet_added_conditions_list,
     }
 
 
@@ -1029,8 +1123,11 @@ def main(args):
         revision=args.revision,
         variant=args.variant,
     )
-    unet = UNet2DCondition_IntraElement_Controller.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, low_cpu_mem_usage=False,
+    unet = UNet2DCondition_InterElement_Controller.from_pretrained(
+        args.pretrained_intra_model_name_or_path if args.pretrained_intra_model_name_or_path is not None else args.pretrained_model_name_or_path, 
+        subfolder="sdxl-intra_element_controller", 
+        revision=args.revision, 
+        low_cpu_mem_usage=False,
     ) # , variant=args.variant
 
 
@@ -1061,7 +1158,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DCondition_IntraElement_Controller)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DCondition_InterElement_Controller)
                 ema_unet.load_state_dict(load_model.state_dict())
                 ema_unet.to(accelerator.device)
                 del load_model
@@ -1071,7 +1168,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DCondition_IntraElement_Controller.from_pretrained(input_dir, subfolder="unet")
+                load_model = UNet2DCondition_InterElement_Controller.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -1088,8 +1185,6 @@ def main(args):
     unet.train()
 
     unet.requires_grad_(False)
-    unet.layout_embedder.requires_grad_(True)
-    unet.layout_embedder.load_weights(controlnet.down_blocks)
 
     unet.down_add.requires_grad_(True)
     unet.mid_add.requires_grad_(True)
@@ -1211,22 +1306,30 @@ def main(args):
         add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype)
         unet_added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
-        prompt_condition_batch = [batch['objects'][bsz][0]['condition'] for bsz in range(len(batch['objects']))]
-        prompt_condition_embeds, pooled_prompt_condition_embeds = encode_prompt(
-            prompt_condition_batch, text_encoders, tokenizers, proportion_empty_prompts, is_train
-        )
-        add_condition_text_embeds = pooled_prompt_condition_embeds
+        prompt_condition_embeds_list = []
+        pooled_prompt_condition_embeds_list = []
+        for bsz in range(len(batch['objects'])):
+            objs = batch['objects'][bsz]
+            conds = [obj['condition'] for obj in objs]
 
-        prompt_condition_embeds = prompt_condition_embeds.to(accelerator.device)
-        add_condition_text_embeds = add_condition_text_embeds.to(accelerator.device)
-        controlnet_added_cond_kwargs = {"condition_text_embeds": add_condition_text_embeds, "time_ids": add_time_ids}
+            conds.append(batch['background'][bsz])
+            if len(conds) == 0:
+                conds = [""]
+            
+            p_embeds, pooled_p_embeds = encode_prompt(
+                conds, text_encoders, tokenizers, proportion_empty_prompts, is_train
+            )
+            # We move them to CPU and convert to list before returning so datasets map can store variable lengths
+            prompt_condition_embeds_list.append(p_embeds.cpu().tolist())
+            pooled_prompt_condition_embeds_list.append(pooled_p_embeds.cpu().tolist())
 
         return {
-            "prompt_embeds": prompt_embeds, 
-            "prompt_condition_embeds": prompt_condition_embeds,
-            **unet_added_cond_kwargs,
-            **controlnet_added_cond_kwargs,
-            }
+            "prompt_embeds": prompt_embeds.cpu().tolist(), 
+            "prompt_condition_embeds": prompt_condition_embeds_list,
+            "text_embeds": add_text_embeds.cpu().tolist(),
+            "time_ids": add_time_ids.cpu().tolist(),
+            "condition_text_embeds": pooled_prompt_condition_embeds_list,
+        }
 
     # Let's first compute all the embeddings so that we can free up the text encoders
     # from memory.
@@ -1403,22 +1506,104 @@ def main(args):
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps).to(dtype=weight_dtype)
 
-                controlnet_content_image = batch["conditioning_content_pixel_values"].to(accelerator.device, dtype=weight_dtype)
-                controlnet_layout_image = batch["conditioning_layout_pixel_values"].to(accelerator.device, dtype=weight_dtype)
-                
 
-                batch["condition_type"] = F.one_hot(batch["condition_type"], num_classes=8).float()
-                batch["layout_type"] = F.one_hot(batch["layout_type"], num_classes=4).float()
+                num_elements = batch["num_elements"]
+                max_num_elements = int(num_elements.max().item())
 
-                layout_type = batch["layout_type"].to(accelerator.device, dtype=weight_dtype)
-                condition_type = batch["condition_type"].to(accelerator.device, dtype=weight_dtype) 
+                accelerator.print(num_elements.shape) # [B]
+                accelerator.print(batch["condition_ids_list"].shape) # [B, L+1, 77, C]
+                accelerator.print(batch["conditioning_content_pixel_values"].shape) # [L+1, C, H, W]
+                accelerator.print(batch["add_condition_text_embeds"].shape) # [L+1, 1, C]
+                accelerator.print(batch["condition_type"].shape) # [B, L+1]
+                # MultiControlNet
+                controlnet_results = []
+                add_time_ids = batch["unet_added_conditions"]["time_ids"]
 
-                # layout_latents = vae.encode(controlnet_layout_image).latent_dist.sample()
-                # layout_latents = layout_latents * vae.config.scaling_factor
-                layout_latents = [controlnet_layout_image for _ in range(4)] 
+                condition_ids_list = batch["condition_ids_list"].to(accelerator.device, dtype=weight_dtype) 
+                add_condition_text_embeds = batch["add_condition_text_embeds"].to(accelerator.device, dtype=weight_dtype)# [B, L+1, 1, C]
+                conditioning_content_pixel_values = batch["conditioning_content_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                condition_type = batch["condition_type"].to(accelerator.device, dtype=torch.long)
 
+
+                condition_ids_list = condition_ids_list.permute(1, 0, 2, 3).contiguous() # [L+1, B, 77, C]
+                add_condition_text_embeds = add_condition_text_embeds.permute(1, 0, 2).contiguous() # [L+1, B, 1, C]
+                conditioning_content_pixel_values = conditioning_content_pixel_values.permute(1, 0, 2, 3, 4).contiguous() # [L+1, B, C, H, W]
+                condition_type = condition_type.permute(1, 0).contiguous() # [L+1, B]
+                for i in range(max_num_elements + 1):
+                    
+                    controlnet_added_conditions = {
+                        "text_embeds": add_condition_text_embeds[i],
+                        "time_ids": add_time_ids,
+                        "control_type": F.one_hot(condition_type[i], num_classes=8).float(),
+                    }
+
+                    controlnet_content_image_list = [conditioning_content_pixel_values[i] for _ in range(8)] 
+                    result = controlnet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=condition_ids_list[i],
+                        added_cond_kwargs=controlnet_added_conditions,
+                        controlnet_cond_list=controlnet_content_image_list,
+                        return_dict=False,
+                    )
+                    controlnet_results.append(result)
+
+                down_block_res_samples_per_controlnet = []
+                mid_block_res_sample_per_controlnet = []
+                extra_per_controlnet = []
+                for result in controlnet_results:
+                    if not isinstance(result, (tuple, list)):
+                        raise ValueError(f"Unexpected controlnet output type: {type(result)}")
+                    if len(result) == 2:
+                        down_block_res_samples, mid_block_res_sample = result
+                        extra = None
+                    elif len(result) == 3:
+                        down_block_res_samples, mid_block_res_sample, extra = result
+                    else:
+                        raise ValueError(f"Unexpected controlnet output length: {len(result)}")
+
+                    down_block_res_samples_per_controlnet.append(down_block_res_samples)
+                    mid_block_res_sample_per_controlnet.append(mid_block_res_sample)
+                    extra_per_controlnet.append(extra)
+
+                num_controlnets = len(down_block_res_samples_per_controlnet)
+                num_layers = len(down_block_res_samples_per_controlnet[0])
+
+                down_block_res_samples_by_layer = [
+                    torch.stack(
+                        [down_block_res_samples_per_controlnet[c][layer_idx] for c in range(num_controlnets)],
+                        dim=0,
+                    )
+                    for layer_idx in range(num_layers)
+                ]
+                mid_block_res_samples_by_controlnet = torch.stack(mid_block_res_sample_per_controlnet, dim=0)
+
+                extra_by_layer = None
+                extra_by_controlnet = None
+                if any(extra is not None for extra in extra_per_controlnet):
+                    if not all(extra is not None for extra in extra_per_controlnet):
+                        raise ValueError("ControlNet extra outputs are partially missing across controlnets.")
+                    if isinstance(extra_per_controlnet[0], (tuple, list)):
+                        extra_num_layers = len(extra_per_controlnet[0])
+                        extra_by_layer = [
+                            torch.stack(
+                                [extra_per_controlnet[c][layer_idx] for c in range(num_controlnets)],
+                                dim=0,
+                            )
+                            for layer_idx in range(extra_num_layers)
+                        ]
+                    else:
+                        extra_by_controlnet = torch.stack(extra_per_controlnet, dim=0)
+
+                layout_type = batch["layout_type"].to(accelerator.device, dtype=torch.long) # [B, L+1]
+                layout_type = F.one_hot(layout_type, num_classes=4).float()
+
+                controlnet_layout_image = batch["conditioning_layout_pixel_values"].to(accelerator.device, dtype=weight_dtype) # [B, L+1, C, H, W]
+
+                layout_latents = controlnet_layout_image.permute(1, 0, 2, 3, 4).contiguous()
 
                 loss_weight = batch["conditioning_mask_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+
                 ori_loss_weight = loss_weight
                 loss_weight = (loss_weight > 0).float()
                 # # reweighted
@@ -1427,18 +1612,6 @@ def main(args):
                 mask_weight = total_area / (mask_area + 1e-6)
                 loss_weight = loss_weight * mask_weight + 1
                 
-                # That's ok if you use only one condition type
-                # controlnet_content_image_list = [[controlnet_content_image] if condition_type[i][j] == 1 else [torch.zeros_like(controlnet_content_image)] for i in range(bsz) for j in range(8)] 
-                controlnet_content_image_list = [controlnet_content_image for _ in range(8)] 
-                batch["controlnet_added_conditions"]['control_type'] = condition_type
-                down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=batch["condition_ids"].to(accelerator.device, dtype=weight_dtype),
-                    added_cond_kwargs=batch["controlnet_added_conditions"],
-                    controlnet_cond_list=controlnet_content_image_list,
-                    return_dict=False,
-                )
 
                 # Predict the noise residual
                 model_pred, mid_hidden_sample = unet(
@@ -1448,8 +1621,8 @@ def main(args):
                     layout_control_type = layout_type,
                     encoder_hidden_states=batch["prompt_ids"].to(accelerator.device, dtype=weight_dtype),
                     added_cond_kwargs=batch["unet_added_conditions"],
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
+                    down_block_additional_residuals=down_block_res_samples_by_layer,
+                    mid_block_additional_residual=mid_block_res_samples_by_controlnet,
                     return_dict=False,
                 )
 

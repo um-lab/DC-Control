@@ -1578,6 +1578,19 @@ class StableDiffusionXLControlNetDotPipeline(
                         guess_mode=guess_mode,
                     )
 
+            if isinstance(layout_image, (list, tuple)):
+                if layout_type is not None:
+                    if isinstance(layout_type, torch.Tensor):
+                        layout_index = int(torch.argmax(layout_type).item())
+                    else:
+                        layout_index = int(layout_type)
+                    layout_image = layout_image[layout_index]
+                else:
+                    layout_image = next((img for img in layout_image if isinstance(img, torch.Tensor)), None)
+
+                if layout_image is None or not isinstance(layout_image, torch.Tensor):
+                    raise ValueError("layout_image must provide a valid image for the chosen layout_type")
+
         elif isinstance(controlnet, MultiControlNetUnionModel):
             images = []
 
@@ -1883,4 +1896,3 @@ class StableDiffusionXLControlNetDotPipeline(
             return (image,)
 
         return StableDiffusionXLPipelineOutput(images=image)
-

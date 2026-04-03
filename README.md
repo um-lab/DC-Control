@@ -19,7 +19,7 @@ from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
 import torch
 from diffusers.utils import load_image
 
-controlnet = ControlNetModel_Union.from_pretrained("/home/cgv/yanghongji/weights/sdxl-controlplus").to(torch.float16)
+controlnet = ControlNetModel_Union.from_pretrained("yang1232009/ControlNetPlus-SDXL").to(torch.float16)
 vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix").to(torch.float16)
 
 pipeline = StableDiffusionXLControlNetUnionPipeline.from_pretrained(
@@ -59,8 +59,14 @@ images.save("example.png")
 
 ```
 
-# IntraElement Controller (for layout injection)
+# Stage-2 Intra-Element Controller (layout injection)
 
 ```bash
 bash train_intra_element_controller.sh
+```
+
+
+# Stage-3 Inter-Element Controller (multiple condition)
+```bash
+bash train_inter_element_controller.sh
 ```

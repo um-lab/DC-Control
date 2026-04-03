@@ -1,10 +1,12 @@
 stage-1/
 inference_single_controlnet.py
+infer_intra_element_controller.py
 .DS_Store
 .env
 .wandb
 example.png
 sdxl-intra_element_controller/
+sdxl-inter_element_controller/
 # compiled files
 __pycache__/
 tools/
